@@ -1,0 +1,1296 @@
+import websocket
+import json
+import threading
+import time
+import logging
+from flask import Flask, render_template, request, jsonify
+import uuid
+from datetime import datetime
+import random
+import queue
+import os
+from pathlib import Path
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# -------------------------
+# Configuration & Persistence
+# -------------------------
+WS_ENDPOINT = "wss://ws.binaryws.com/websockets/v3"
+CONFIG_PATH = Path(__file__).parent / "bot_config.json"
+RECONNECT_DELAY = 5
+PING_INTERVAL = 15
+MAX_REQUESTS_PER_SECOND = 3
+
+def save_settings(api_key, app_id, account_id):
+    """Save settings to persistent storage"""
+    try:
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump({
+                'api_key': api_key,
+                'app_id': app_id,
+                'account_id': account_id
+            }, f)
+        logger.info("✅ Settings saved successfully.")
+    except Exception as e:
+        logger.error(f"⚠️ Failed to save settings: {e}")
+
+def load_settings():
+    """Load settings from persistent storage"""
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, 'r') as f:
+                data = json.load(f)
+                logger.info("✅ Loaded saved settings.")
+                return data
+        except Exception as e:
+            logger.error(f"⚠️ Failed to load settings: {e}")
+    return {}
+
+# -------------------------
+# Utility: rate limiter
+# -------------------------
+class RateLimiter:
+    def __init__(self, rate_per_sec: float):
+        self.rate = rate_per_sec
+        self.allowance = rate_per_sec
+        self.last_check = time.time()
+        self.lock = threading.Lock()
+
+    def wait_for_slot(self):
+        while True:
+            with self.lock:
+                current = time.time()
+                time_passed = current - self.last_check
+                self.last_check = current
+                self.allowance += time_passed * self.rate
+                if self.allowance > self.rate:
+                    self.allowance = self.rate
+                if self.allowance >= 1.0:
+                    self.allowance -= 1.0
+                    return
+            time.sleep(0.01)
+
+# -------------------------
+# Enhanced Deriv Client with Real Trading & Persistence
+# -------------------------
+class DerivWebsocketClient:
+    def __init__(self, endpoint: str, token: str, app_id: str = "1089", account_id: str = None):
+        self.endpoint = f"{endpoint}?app_id={app_id}"
+        self.token = token
+        self.app_id = app_id
+        self.expected_account_id = account_id
+        self.ws = None
+        self.thread = None
+        self.running = False
+        self.req_id_counter = 0
+        self.pending_req_map = {}
+        self.active_contracts = {}
+        self.rate_limiter = RateLimiter(MAX_REQUESTS_PER_SECOND)
+        self.incoming_queue = queue.Queue()
+        self.connected = False
+        self.authorized = False
+        self.account_id = None
+        self.is_demo = False
+        self.balance = 0.0
+        self.currency = "USD"
+        
+        # Enhanced: Store recent proposals for quick buying
+        self.recent_proposals = {}
+        
+        # Enhanced: Trading history
+        self.trade_history = []
+        
+        # Enhanced: Connection monitoring
+        self.last_pong = time.time()
+        
+        # Callbacks for external handling
+        self.on_authorize = None
+        self.on_balance = None
+        self.on_tick = None
+        self.on_buy = None
+        self.on_sell = None
+        self.on_proposal = None
+        self.on_trade_error = None
+        self.on_contract_update = None
+
+    def _next_req_id(self):
+        self.req_id_counter += 1
+        return self.req_id_counter
+
+    def _send(self, payload: dict):
+        self.rate_limiter.wait_for_slot()
+        try:
+            s = json.dumps(payload)
+            logger.debug(">>> %s", s)
+            if self.ws:
+                self.ws.send(s)
+        except Exception as e:
+            logger.exception("Send failed: %s", e)
+
+    # Enhanced: Connection management with auto-reconnect and persistence
+    def connect_and_run(self):
+        self.running = True
+        while self.running:
+            try:
+                logger.info("Connecting to %s", self.endpoint)
+                self.ws = websocket.WebSocketApp(self.endpoint,
+                                                 on_open=self._on_open,
+                                                 on_message=self._on_message,
+                                                 on_error=self._on_error,
+                                                 on_close=self._on_close)
+                self.thread = threading.Thread(target=self.ws.run_forever, 
+                                             kwargs={"ping_interval": PING_INTERVAL, "ping_timeout": 10}, 
+                                             daemon=True)
+                self.thread.start()
+
+                processor_thread = threading.Thread(target=self._process_incoming, daemon=True)
+                processor_thread.start()
+
+                self._start_keepalive()
+
+                while self.thread.is_alive() and self.running:
+                    time.sleep(1)
+
+            except Exception as e:
+                logger.exception("Connection failed: %s", e)
+
+            if self.running:
+                logger.info("Reconnecting after %s seconds...", RECONNECT_DELAY)
+                time.sleep(RECONNECT_DELAY)
+            else:
+                break
+
+    def _start_keepalive(self):
+        def ping_loop():
+            while self.running:
+                try:
+                    if self.connected:
+                        self._send({"ping": 1})
+                except Exception:
+                    logger.exception("Keepalive ping failed")
+                time.sleep(PING_INTERVAL)
+        t = threading.Thread(target=ping_loop, daemon=True)
+        t.start()
+
+    def _on_open(self, ws):
+        logger.info("WebSocket opened, authorizing...")
+        self.connected = True
+        self.authorize()
+
+    def _on_error(self, ws, error):
+        logger.error("WebSocket error: %s", error)
+        self.connected = False
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        logger.warning("WebSocket closed: %s %s", close_status_code, close_msg)
+        self.connected = False
+        self.authorized = False
+
+    def _on_message(self, ws, message):
+        try:
+            logger.debug("<<< %s", message)
+            data = json.loads(message)
+            self.incoming_queue.put(data)
+        except Exception as e:
+            logger.exception("Failed to parse incoming message: %s", e)
+
+    # Enhanced: Process incoming messages with account verification
+    def _process_incoming(self):
+        while self.running:
+            try:
+                data = self.incoming_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            req_id = data.get("req_id")
+            error_msg = data.get("error", {}).get("message") if "error" in data else None
+
+            if error_msg:
+                logger.error("API error: %s", error_msg)
+                if req_id in self.pending_req_map:
+                    pending_req = self.pending_req_map[req_id]
+                    if self.on_trade_error:
+                        self.on_trade_error(pending_req, error_msg)
+                    del self.pending_req_map[req_id]
+                continue
+
+            # Handle pong response
+            if "pong" in data:
+                self.last_pong = time.time()
+                continue
+
+            # Enhanced: Handle authorization response with account verification
+            if "authorize" in data:
+                auth = data["authorize"]
+                self.account_id = auth.get("loginid")
+                self.is_demo = auth.get("loginid", "").startswith('VRTC')
+                self.authorized = True
+                self.currency = auth.get("currency", "USD")
+                
+                # Account verification
+                if self.expected_account_id and self.account_id != self.expected_account_id:
+                    logger.warning(f"⚠️ Account mismatch. Expected {self.expected_account_id}, got {self.account_id}")
+                else:
+                    logger.info(f"✅ Authorized. Login id: {self.account_id}, account_type: {auth.get('account_type')}, currency: {self.currency}")
+                
+                if self.on_authorize:
+                    self.on_authorize(auth)
+                
+                # Subscribe to balance updates
+                self.get_balance(subscribe=True)
+                continue
+
+            # Handle balance updates
+            if "balance" in data:
+                balance_data = data.get("balance", {})
+                self.balance = float(balance_data.get("balance", 0))
+                logger.info("Balance update: %.2f %s", self.balance, self.currency)
+                
+                if self.on_balance:
+                    self.on_balance(balance_data)
+                continue
+
+            # Handle active symbols
+            if "active_symbols" in data:
+                symbols = data["active_symbols"]
+                logger.info("Received %s active symbols", len(symbols))
+                continue
+
+            # Handle tick data
+            if "tick" in data:
+                tick = data["tick"]
+                symbol = tick.get("symbol")
+                quote = tick.get("quote")
+                epoch = tick.get("epoch")
+                logger.debug("Tick update - %s: %s", symbol, quote)
+                
+                if self.on_tick:
+                    self.on_tick(tick)
+                continue
+
+            # Enhanced: Handle proposal responses with storage
+            if "proposal" in data:
+                proposal = data["proposal"]
+                req_id = data.get("req_id")
+                
+                if req_id in self.pending_req_map:
+                    pending_req = self.pending_req_map[req_id]
+                    logger.info("Proposal received - %s %s: Payout %s, Ask: %s", 
+                               pending_req.get("symbol"), pending_req.get("contract_type"),
+                               proposal.get("payout"), proposal.get("ask_price"))
+                    
+                    # Store proposal for quick buying
+                    self.recent_proposals[req_id] = {
+                        "proposal": proposal,
+                        "request": pending_req,
+                        "timestamp": time.time()
+                    }
+                    
+                    if self.on_proposal:
+                        self.on_proposal(pending_req, proposal)
+                    del self.pending_req_map[req_id]
+                continue
+
+            # Enhanced: Handle buy responses with contract tracking
+            if "buy" in data:
+                buy_resp = data["buy"]
+                contract_id = buy_resp.get("contract_id")
+                longcode = buy_resp.get("longcode")
+                payout = buy_resp.get("payout")
+                req_id = data.get("req_id")
+                
+                if req_id in self.pending_req_map:
+                    pending_req = self.pending_req_map[req_id]
+                    logger.info("Trade executed - Contract: %s, Type: %s, Payout: %s", 
+                               contract_id, pending_req.get("contract_type"), payout)
+                    
+                    # Store active contract
+                    contract_data = {
+                        "symbol": pending_req.get("symbol"),
+                        "contract_type": pending_req.get("contract_type"),
+                        "amount": pending_req.get("amount"),
+                        "payout": payout,
+                        "purchase_time": time.time(),
+                        "status": "open",
+                        "req_id": req_id,
+                        "buy_response": buy_resp
+                    }
+                    self.active_contracts[contract_id] = contract_data
+                    
+                    # Add to trade history
+                    self.trade_history.append({
+                        **contract_data,
+                        "contract_id": contract_id,
+                        "action": "buy",
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    
+                    # Subscribe to contract updates
+                    self.subscribe_open_contract(contract_id)
+                    
+                    if self.on_buy:
+                        self.on_buy(contract_id, contract_data, buy_resp)
+                    
+                    del self.pending_req_map[req_id]
+                continue
+
+            # Enhanced: Handle sell responses
+            if "sell" in data:
+                sell_resp = data["sell"]
+                contract_id = sell_resp.get("contract_id")
+                sold_for = sell_resp.get("sold_for")
+                profit_loss = sell_resp.get("profit")
+                req_id = data.get("req_id")
+                
+                if req_id in self.pending_req_map:
+                    pending_req = self.pending_req_map[req_id]
+                    logger.info("Trade closed - Contract: %s, Sold for: %s, Profit: %s", 
+                               contract_id, sold_for, profit_loss)
+                    
+                    if contract_id in self.active_contracts:
+                        self.active_contracts[contract_id]["status"] = "closed"
+                        self.active_contracts[contract_id]["sell_price"] = sold_for
+                        self.active_contracts[contract_id]["profit"] = float(profit_loss) if profit_loss else 0
+                        
+                        # Update trade history
+                        for trade in self.trade_history:
+                            if trade.get("contract_id") == contract_id:
+                                trade.update({
+                                    "sell_response": sell_resp,
+                                    "sell_time": time.time(),
+                                    "profit": float(profit_loss) if profit_loss else 0
+                                })
+                                break
+                    
+                    if self.on_sell:
+                        self.on_sell(contract_id, self.active_contracts.get(contract_id, {}), sell_resp)
+                    
+                    del self.pending_req_map[req_id]
+                continue
+
+            # Enhanced: Handle contract updates with better monitoring
+            if "proposal_open_contract" in data:
+                contract_data = data["proposal_open_contract"]
+                contract_id = contract_data.get("contract_id")
+                current_spot = contract_data.get("current_spot")
+                profit = contract_data.get("profit")
+                status = contract_data.get("status")
+                is_expired = contract_data.get("is_expired")
+                is_sold = contract_data.get("is_sold")
+                
+                if contract_id in self.active_contracts:
+                    self.active_contracts[contract_id]["current_spot"] = current_spot
+                    self.active_contracts[contract_id]["profit"] = profit
+                    self.active_contracts[contract_id]["status"] = status
+                    self.active_contracts[contract_id]["is_expired"] = is_expired
+                    self.active_contracts[contract_id]["is_sold"] = is_sold
+                    
+                    # Auto-sell if contract is expired or should be closed
+                    if status in ["sold", "expired"] and self.active_contracts[contract_id].get("status") != "closed":
+                        self.active_contracts[contract_id]["status"] = "closed"
+                        logger.info("Contract %s auto-closed with status: %s", contract_id, status)
+                    
+                    if self.on_contract_update:
+                        self.on_contract_update(contract_id, self.active_contracts[contract_id])
+                continue
+
+            # Handle other message types
+            if "msg_type" in data:
+                mt = data["msg_type"]
+                logger.debug("msg_type=%s : %s", mt, data)
+                continue
+
+            logger.debug("Unhandled incoming message: %s", data)
+
+    # Enhanced: Core trading functions with better error handling
+    def authorize(self):
+        req_id = self._next_req_id()
+        payload = {"authorize": self.token, "req_id": req_id}
+        self.pending_req_map[req_id] = {"type": "authorize", "time": time.time()}
+        self._send(payload)
+        return req_id
+
+    def get_balance(self, subscribe: bool = True):
+        req_id = self._next_req_id()
+        payload = {"balance": 1, "subscribe": 1 if subscribe else 0, "req_id": req_id}
+        self.pending_req_map[req_id] = {"type": "balance", "time": time.time()}
+        self._send(payload)
+        return req_id
+
+    def get_active_symbols(self):
+        req_id = self._next_req_id()
+        payload = {"active_symbols": "brief", "product_type": "basic", "req_id": req_id}
+        self.pending_req_map[req_id] = {"type": "active_symbols", "time": time.time()}
+        self._send(payload)
+        return req_id
+
+    def subscribe_ticks(self, symbol: str):
+        req_id = self._next_req_id()
+        payload = {
+            "ticks": symbol,
+            "subscribe": 1,
+            "req_id": req_id
+        }
+        self.pending_req_map[req_id] = {"type": "ticks_subscribe", "symbol": symbol, "time": time.time()}
+        self._send(payload)
+        return req_id
+
+    def unsubscribe_ticks(self, symbol: str):
+        req_id = self._next_req_id()
+        payload = {
+            "forget": symbol,
+            "req_id": req_id
+        }
+        self.pending_req_map[req_id] = {"type": "ticks_unsubscribe", "symbol": symbol, "time": time.time()}
+        self._send(payload)
+        return req_id
+
+    # Enhanced: Proposal system with quick buy capability
+    def get_proposal(self, symbol: str, contract_type: str, duration: int, duration_unit: str, amount: float):
+        req_id = self._next_req_id()
+        payload = {
+            "proposal": 1,
+            "amount": amount,
+            "basis": "stake",
+            "contract_type": contract_type.lower(),
+            "currency": self.currency,
+            "duration": duration,
+            "duration_unit": duration_unit,
+            "symbol": symbol,
+            "req_id": req_id
+        }
+        self.pending_req_map[req_id] = {
+            "type": "proposal", 
+            "symbol": symbol, 
+            "contract_type": contract_type,
+            "amount": amount,
+            "time": time.time()
+        }
+        self._send(payload)
+        return req_id
+
+    def quick_buy_from_proposal(self, proposal_req_id: int):
+        """Quick buy using a previously requested proposal"""
+        if proposal_req_id not in self.recent_proposals:
+            logger.error("No proposal found for req_id: %s", proposal_req_id)
+            return None
+            
+        proposal_data = self.recent_proposals[proposal_req_id]
+        proposal = proposal_data["proposal"]
+        proposal_id = proposal.get("id")
+        price = proposal.get("ask_price") or proposal.get("price")
+        
+        if not proposal_id or not price:
+            logger.error("Invalid proposal data for quick buy")
+            return None
+            
+        return self.place_real_trade_from_proposal(proposal_id, price, proposal_data["request"])
+
+    def place_real_trade(self, symbol: str, contract_type: str, duration: int, duration_unit: str, amount: float):
+        """Enhanced: Place real trade with proposal flow"""
+        # First get proposal, then buy
+        proposal_req_id = self.get_proposal(symbol, contract_type, duration, duration_unit, amount)
+        
+        # Set up a callback to automatically buy when proposal is received
+        original_callback = self.on_proposal
+        
+        def auto_buy_callback(pending_req, proposal):
+            proposal_id = proposal.get("id")
+            price = proposal.get("ask_price") or proposal.get("price")
+            if proposal_id and price:
+                self.place_real_trade_from_proposal(proposal_id, price, pending_req)
+            # Restore original callback
+            self.on_proposal = original_callback
+        
+        self.on_proposal = auto_buy_callback
+        
+        return proposal_req_id
+
+    def place_real_trade_from_proposal(self, proposal_id: str, price: float, trade_request: dict):
+        """Place trade using proposal ID"""
+        req_id = self._next_req_id()
+        payload = {
+            "buy": proposal_id,
+            "price": price,
+            "parameters": {
+                "amount": trade_request.get("amount"),
+                "basis": "stake",
+                "contract_type": trade_request.get("contract_type", "").lower(),
+                "currency": self.currency,
+                "duration": trade_request.get("duration"),
+                "duration_unit": trade_request.get("duration_unit"),
+                "symbol": trade_request.get("symbol")
+            },
+            "req_id": req_id
+        }
+        self.pending_req_map[req_id] = {
+            "type": "buy", 
+            "symbol": trade_request.get("symbol"), 
+            "contract_type": trade_request.get("contract_type"),
+            "amount": trade_request.get("amount"),
+            "time": time.time()
+        }
+        self._send(payload)
+        return req_id
+
+    def close_trade(self, contract_id: str):
+        req_id = self._next_req_id()
+        payload = {
+            "sell": contract_id,
+            "price": 0,
+            "req_id": req_id
+        }
+        self.pending_req_map[req_id] = {"type": "sell", "contract_id": contract_id, "time": time.time()}
+        self._send(payload)
+        return req_id
+
+    def sell_all_contracts(self):
+        for contract_id in list(self.active_contracts.keys()):
+            if self.active_contracts[contract_id].get("status") == "open":
+                self.close_trade(contract_id)
+
+    def subscribe_open_contract(self, contract_id: str):
+        req_id = self._next_req_id()
+        payload = {
+            "proposal_open_contract": 1,
+            "contract_id": contract_id,
+            "subscribe": 1,
+            "req_id": req_id
+        }
+        self._send(payload)
+        return req_id
+
+    def get_trade_history(self, limit: int = 50):
+        req_id = self._next_req_id()
+        payload = {
+            "statement": 1,
+            "limit": limit,
+            "req_id": req_id
+        }
+        self._send(payload)
+        return req_id
+
+    def stop(self):
+        self.running = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
+# Enhanced: Trading Bot with Profitable Strategies & Persistence
+class DerivHybridTradingBot:
+    def __init__(self):
+        self.ws = None
+        self.connected = False
+        self.authorized = False
+        self.account_id = None
+        self.api_key = None
+        self.app_id = "1089"
+        self.is_demo = True
+        self.tradable_symbols = []
+        self.active_trades = {}
+        self.account_balance = 1000
+        self.account_equity = 1000
+        self.max_drawdown = 0
+        self.max_open_trades = 10
+        self.base_lot_size = 0.01
+        self.auto_lot_adjustment = True
+        self.trade_speed = "ultra"
+        self.selected_symbol = "R_100"
+        self.selected_timeframe = "60"
+        self.trading_enabled = False
+        self.risk_paused = False
+        self.last_trade_time = 0
+        self.trade_count = 0
+        self.profit_loss = 0
+        self.websocket_thread = None
+        self.trading_thread = None
+        
+        # Risk Management
+        self.max_daily_loss = 200
+        self.max_consecutive_losses = 5
+        self.consecutive_losses = 0
+        self.daily_profit_target = 500
+        self.daily_traded_volume = 0
+        self.last_reset_time = datetime.now()
+        
+        # Lot Management
+        self.aggressive_growth = True
+        self.lot_multiplier = 1.0
+        self.min_lot_size = 0.01
+        self.max_lot_size = 20.0
+        self.profit_boost_factor = 2.0
+        
+        # Trading Settings
+        self.trade_cooldown = 0.5
+        self.analysis_speed = 0.1
+        self.max_trades_per_minute = 50
+        
+        # Enhanced: Strategy Parameters from provided codes
+        self.strategy_params = {
+            'volatility_indices': {
+                'ma_fast': 2, 'ma_slow': 8, 'volatility_period': 6,
+                'momentum_period': 4, 'spike_threshold': 1.2, 'recovery_target': 0.2,
+                'profit_lock': 0.1, 'trailing_stop': 0.08,
+                'preferred_duration': 5, 'preferred_unit': 't'
+            },
+            'boom_crash': {
+                'ma_fast': 1, 'ma_slow': 5, 'volatility_period': 4,
+                'momentum_period': 3, 'spike_threshold': 1.5, 'recovery_target': 0.3,
+                'profit_lock': 0.15, 'trailing_stop': 0.12,
+                'preferred_duration': 5, 'preferred_unit': 't'
+            },
+            'forex': {
+                'ma_fast': 3, 'ma_slow': 10, 'volatility_period': 8,
+                'momentum_period': 6, 'spike_threshold': 0.8, 'recovery_target': 0.15,
+                'profit_lock': 0.08, 'trailing_stop': 0.06,
+                'preferred_duration': 15, 'preferred_unit': 's'
+            }
+        }
+        
+        # Current strategy settings
+        self.ma_fast = 2
+        self.ma_slow = 8
+        self.volatility_period = 6
+        self.momentum_period = 4
+        self.spike_threshold = 1.2
+        self.recovery_target = 0.2
+        self.profit_lock = 0.1
+        self.trailing_stop = 0.08
+        self.preferred_duration = 5
+        self.preferred_unit = 't'
+        
+        self.only_close_profitable = True
+        self.let_profits_run = True
+        self.cut_losses_early = False
+        
+        self.trades_per_minute = 0
+        self.last_minute_check = time.time()
+        self.trades_this_minute = 0
+        
+        self.price_data = {}
+        self.current_prices = {}
+        
+        # Enhanced: Deriv Symbols with market classification
+        self.deriv_symbols = [
+            {"symbol": "R_10", "name": "Volatility 10 Index", "market": "volatility_indices"},
+            {"symbol": "R_25", "name": "Volatility 25 Index", "market": "volatility_indices"},
+            {"symbol": "R_50", "name": "Volatility 50 Index", "market": "volatility_indices"},
+            {"symbol": "R_75", "name": "Volatility 75 Index", "market": "volatility_indices"},
+            {"symbol": "R_100", "name": "Volatility 100 Index", "market": "volatility_indices"},
+            {"symbol": "R_150", "name": "Volatility 150 Index", "market": "volatility_indices"},
+            {"symbol": "R_200", "name": "Volatility 200 Index", "market": "volatility_indices"},
+            {"symbol": "BOOM1000", "name": "Boom 1000 Index", "market": "boom_crash"},
+            {"symbol": "BOOM500", "name": "Boom 500 Index", "market": "boom_crash"},
+            {"symbol": "BOOM300", "name": "Boom 300 Index", "market": "boom_crash"},
+            {"symbol": "CRASH1000", "name": "Crash 1000 Index", "market": "boom_crash"},
+            {"symbol": "CRASH500", "name": "Crash 500 Index", "market": "boom_crash"},
+            {"symbol": "CRASH300", "name": "Crash 300 Index", "market": "boom_crash"},
+            {"symbol": "frxEURUSD", "name": "EUR/USD", "market": "forex"},
+            {"symbol": "frxGBPUSD", "name": "GBP/USD", "market": "forex"},
+            {"symbol": "frxUSDJPY", "name": "USD/JPY", "market": "forex"}
+        ]
+        
+        # Initialize Enhanced Deriv client
+        self.deriv_client = None
+        
+        # Enhanced: Price history for strategy analysis
+        self.price_history = {}
+        self.last_analysis_time = 0
+        
+        # Enhanced: Trading signals
+        self.trading_signals = {}
+        
+    def get_market_type(self, symbol):
+        for deriv_symbol in self.deriv_symbols:
+            if deriv_symbol['symbol'] == symbol:
+                return deriv_symbol['market']
+        return 'volatility_indices'
+    
+    def auto_set_strategy(self, symbol):
+        market_type = self.get_market_type(symbol)
+        
+        if market_type in ['volatility_indices']:
+            params = self.strategy_params['volatility_indices']
+        elif market_type == 'boom_crash':
+            params = self.strategy_params['boom_crash']
+        else:
+            params = self.strategy_params['forex']
+        
+        self.ma_fast = params['ma_fast']
+        self.ma_slow = params['ma_slow']
+        self.volatility_period = params['volatility_period']
+        self.momentum_period = params['momentum_period']
+        self.spike_threshold = params['spike_threshold']
+        self.recovery_target = params['recovery_target']
+        self.profit_lock = params['profit_lock']
+        self.trailing_stop = params['trailing_stop']
+        self.preferred_duration = params['preferred_duration']
+        self.preferred_unit = params['preferred_unit']
+        
+        logger.info(f"Auto-set {market_type} strategy for {symbol}")
+    
+    # Enhanced: Profitable Trading Strategy
+    def generate_trading_signal(self, symbol):
+        """Enhanced: Generate buy/sell signals based on market analysis"""
+        if symbol not in self.price_history or len(self.price_history[symbol]) < max(self.ma_slow, self.volatility_period):
+            return "NO_SIGNAL"
+        
+        prices = self.price_history[symbol][-self.ma_slow:]
+        
+        # Calculate moving averages
+        if len(prices) >= self.ma_fast:
+            fast_ma = sum(prices[-self.ma_fast:]) / self.ma_fast
+        else:
+            fast_ma = prices[-1]
+            
+        if len(prices) >= self.ma_slow:
+            slow_ma = sum(prices[-self.ma_slow:]) / self.ma_slow
+        else:
+            slow_ma = prices[-1]
+        
+        # Calculate volatility
+        if len(prices) >= self.volatility_period:
+            recent_prices = prices[-self.volatility_period:]
+            volatility = max(recent_prices) - min(recent_prices)
+            avg_price = sum(recent_prices) / len(recent_prices)
+            normalized_volatility = volatility / avg_price if avg_price > 0 else 0
+        else:
+            normalized_volatility = 0
+        
+        # Calculate momentum
+        if len(prices) >= self.momentum_period:
+            momentum = prices[-1] - prices[-self.momentum_period]
+        else:
+            momentum = 0
+        
+        # Generate signals based on strategy
+        current_price = prices[-1]
+        
+        # Bullish signal: Fast MA above Slow MA + positive momentum + high volatility
+        if (fast_ma > slow_ma and momentum > 0 and 
+            normalized_volatility > self.spike_threshold and
+            current_price > fast_ma):
+            return "CALL"
+        
+        # Bearish signal: Fast MA below Slow MA + negative momentum + high volatility
+        elif (fast_ma < slow_ma and momentum < 0 and 
+              normalized_volatility > self.spike_threshold and
+              current_price < fast_ma):
+            return "PUT"
+        
+        return "NO_SIGNAL"
+    
+    def calculate_dynamic_lot_size(self):
+        if not self.auto_lot_adjustment:
+            return self.base_lot_size
+        
+        # Use real balance if available
+        balance = self.deriv_client.balance if self.deriv_client and self.deriv_client.balance else self.account_balance
+        base_balance = 1000
+        balance_growth = balance / base_balance
+        
+        if self.profit_loss > 0:
+            growth_factor = balance_growth * self.profit_boost_factor
+        else:
+            growth_factor = balance_growth * 0.8
+        
+        calculated_lot = self.base_lot_size * growth_factor * self.lot_multiplier
+        lot_size = max(self.min_lot_size, min(self.max_lot_size, calculated_lot))
+        
+        return round(lot_size, 2)
+    
+    def update_lot_multiplier(self):
+        if self.profit_loss > 100:
+            self.lot_multiplier = min(5.0, self.lot_multiplier + 0.2)
+        elif self.profit_loss < -50:
+            self.lot_multiplier = max(0.3, self.lot_multiplier - 0.1)
+    
+    # Enhanced: Real Deriv Connection with persistence and account verification
+    def connect_to_deriv(self):
+        try:
+            if not self.api_key:
+                logger.error("No API key provided")
+                return False
+                
+            self.deriv_client = DerivWebsocketClient(WS_ENDPOINT, self.api_key, self.app_id, self.account_id)
+            
+            # Set up callbacks for proper event handling
+            self.deriv_client.on_authorize = self._on_authorize
+            self.deriv_client.on_balance = self._on_balance
+            self.deriv_client.on_tick = self._on_tick
+            self.deriv_client.on_buy = self._on_buy
+            self.deriv_client.on_sell = self._on_sell
+            self.deriv_client.on_proposal = self._on_proposal
+            self.deriv_client.on_trade_error = self._on_trade_error
+            self.deriv_client.on_contract_update = self._on_contract_update
+            
+            self.deriv_client_thread = threading.Thread(target=self.deriv_client.connect_and_run)
+            self.deriv_client_thread.daemon = True
+            self.deriv_client_thread.start()
+            
+            # Wait for connection with timeout
+            for i in range(15):
+                if self.deriv_client and self.deriv_client.connected:
+                    break
+                time.sleep(1)
+            
+            if self.deriv_client and self.deriv_client.connected:
+                self.connected = True
+                logger.info(f"Connected to Deriv API with App ID: {self.app_id}")
+                return True
+            else:
+                logger.error("Failed to connect to Deriv API")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Connection error: {e}")
+            return False
+
+    # Enhanced: Callback handlers with strategy integration
+    def _on_authorize(self, auth_data):
+        self.authorized = True
+        self.account_id = auth_data.get("loginid")
+        self.is_demo = auth_data.get("loginid", "").startswith('VRTC')
+        logger.info(f"Authorization successful - Account: {self.account_id}")
+
+    def _on_balance(self, balance_data):
+        if self.deriv_client:
+            self.account_balance = self.deriv_client.balance
+            logger.info(f"Balance updated: {self.account_balance}")
+
+    def _on_tick(self, tick_data):
+        symbol = tick_data.get("symbol")
+        quote = tick_data.get("quote")
+        
+        if symbol and quote:
+            # Convert quote to float for analysis
+            try:
+                price = float(quote)
+                self.current_prices[symbol] = price
+                
+                # Update price history for strategy analysis
+                if symbol not in self.price_history:
+                    self.price_history[symbol] = []
+                self.price_history[symbol].append(price)
+                
+                # Keep only recent prices for analysis
+                if len(self.price_history[symbol]) > 100:
+                    self.price_history[symbol] = self.price_history[symbol][-50:]
+                    
+            except (ValueError, TypeError):
+                pass
+
+    def _on_buy(self, contract_id, trade_data, buy_response):
+        # Update our active trades with the real contract ID
+        for trade_id, trade in list(self.active_trades.items()):
+            if trade.get('req_id') == trade_data.get('req_id'):
+                trade['real_contract_id'] = contract_id
+                trade['status'] = 'open'
+                trade['contract_id'] = contract_id
+                trade['buy_response'] = buy_response
+                logger.info(f"Trade confirmed with contract ID: {contract_id}")
+
+    def _on_sell(self, contract_id, trade_data, sell_response):
+        # Update profit/loss from real trade
+        if trade_data and 'profit' in trade_data:
+            profit = trade_data['profit']
+            self.profit_loss += profit
+            
+            # Update consecutive losses count
+            if profit < 0:
+                self.consecutive_losses += 1
+            else:
+                self.consecutive_losses = 0
+                
+            logger.info(f"Trade closed - Contract: {contract_id}, Profit: {profit}")
+
+    def _on_proposal(self, proposal_req, proposal_data):
+        # Handle proposal responses for pre-trade analysis
+        logger.info(f"Proposal received for {proposal_req.get('symbol')}: {proposal_data}")
+
+    def _on_trade_error(self, trade_req, error_msg):
+        logger.error(f"Trade error for {trade_req.get('symbol')}: {error_msg}")
+        # Handle trade errors (insufficient balance, market closed, etc.)
+
+    def _on_contract_update(self, contract_id, contract_data):
+        # Monitor contract updates for auto-trading decisions
+        if contract_data.get('status') in ['sold', 'expired']:
+            logger.info(f"Contract {contract_id} completed with status: {contract_data.get('status')}")
+
+    def authorize_account(self):
+        if not self.api_key:
+            logger.error("No API key provided")
+            return
+            
+        if self.deriv_client:
+            self.deriv_client.authorize()
+    
+    def get_balance(self):
+        if self.deriv_client:
+            self.deriv_client.get_balance()
+    
+    # Enhanced: Start trading with strategy
+    def start_trading(self):
+        if not self.authorized:
+            logger.error("Not authorized - cannot start trading")
+            return False
+        
+        self.auto_set_strategy(self.selected_symbol)
+        self.trading_enabled = True
+        
+        # Subscribe to ticks for the selected symbol
+        if self.deriv_client and self.deriv_client.authorized:
+            self.deriv_client.subscribe_ticks(self.selected_symbol)
+        
+        self.trading_thread = threading.Thread(target=self.trading_loop)
+        self.trading_thread.daemon = True
+        self.trading_thread.start()
+        
+        logger.info(f"Trading started on {self.selected_symbol}")
+        return True
+    
+    def stop_trading(self):
+        self.trading_enabled = False
+        # Close all open trades when stopping
+        if self.deriv_client:
+            self.deriv_client.sell_all_contracts()
+        logger.info("Trading stopped")
+    
+    # Enhanced: Restart bot functionality
+    def restart_bot(self):
+        """Enhanced: Restart the bot with current settings"""
+        logger.info("🔄 Restarting bot...")
+        self.stop_trading()
+        if self.deriv_client:
+            self.deriv_client.stop()
+        time.sleep(3)
+        return self.connect_to_deriv()
+    
+    # Enhanced: Trading loop with profitable strategy
+    def trading_loop(self):
+        while self.trading_enabled:
+            try:
+                start_time = time.time()
+                
+                self.check_trading_speed()
+                self.check_risk_management()
+                self.update_account_info()
+                self.update_lot_multiplier()
+                self.monitor_active_trades()
+                self.reset_daily_metrics()
+                
+                # Enhanced: Real trading logic with strategy signals
+                if (not self.risk_paused and 
+                    len(self.active_trades) < self.max_open_trades and
+                    self.trades_this_minute < self.max_trades_per_minute and
+                    self.deriv_client and self.deriv_client.authorized):
+                    
+                    # Generate trading signal based on strategy
+                    signal = self.generate_trading_signal(self.selected_symbol)
+                    
+                    if signal in ["CALL", "PUT"] and time.time() - self.last_trade_time > self.trade_cooldown:
+                        self.execute_strategy_trade(signal)
+                
+                elapsed = time.time() - start_time
+                sleep_time = max(0, self.analysis_speed - elapsed)
+                time.sleep(sleep_time)
+                
+            except Exception as e:
+                logger.error(f"Trading loop error: {e}")
+                time.sleep(1)
+    
+    def execute_strategy_trade(self, signal):
+        """Execute trade based on strategy signal"""
+        lot_size = self.calculate_dynamic_lot_size()
+        
+        # Check if we have sufficient balance
+        if self.deriv_client.balance < lot_size:
+            logger.warning(f"Insufficient balance: {self.deriv_client.balance} < {lot_size}")
+            return
+        
+        try:
+            # Place real trade using enhanced client
+            req_id = self.deriv_client.place_real_trade(
+                symbol=self.selected_symbol,
+                contract_type=signal,
+                duration=self.preferred_duration,
+                duration_unit=self.preferred_unit,
+                amount=lot_size
+            )
+            
+            # Store trade information
+            contract_id = f"pending_{req_id}"
+            self.active_trades[contract_id] = {
+                'symbol': self.selected_symbol,
+                'transaction_id': contract_id,
+                'start_time': datetime.now(),
+                'buy_price': lot_size,
+                'payout': lot_size * 0.95,  # Estimated
+                'contract_type': signal,
+                'duration': self.preferred_duration,
+                'status': 'pending',
+                'direction': 'BUY',
+                'lot_size': lot_size,
+                'current_profit': 0,
+                'req_id': req_id,
+                'signal': signal
+            }
+            
+            self.trade_count += 1
+            self.trades_this_minute += 1
+            self.daily_traded_volume += lot_size
+            self.last_trade_time = time.time()
+            
+            logger.info(f"Strategy trade executed - {signal} on {self.selected_symbol} - Lot: {lot_size}")
+            
+        except Exception as e:
+            logger.error(f"Failed to execute strategy trade: {e}")
+
+    def check_trading_speed(self):
+        current_time = time.time()
+        if current_time - self.last_minute_check >= 60:
+            self.trades_per_minute = self.trades_this_minute
+            self.trades_this_minute = 0
+            self.last_minute_check = current_time
+    
+    def check_risk_management(self):
+        # Check daily loss limit
+        if self.profit_loss <= -self.max_daily_loss:
+            self.risk_paused = True
+            logger.warning(f"Daily loss limit reached: {self.profit_loss}")
+            return
+        
+        # Check consecutive losses
+        if self.consecutive_losses >= self.max_consecutive_losses:
+            self.risk_paused = True
+            logger.warning(f"Max consecutive losses reached: {self.consecutive_losses}")
+            return
+        
+        # Check balance
+        if self.deriv_client and self.deriv_client.balance < self.min_lot_size:
+            self.risk_paused = True
+            logger.warning(f"Insufficient balance: {self.deriv_client.balance}")
+            return
+        
+        # Auto-resume after cooldown
+        if self.risk_paused and time.time() - self.last_trade_time > 60:
+            self.risk_paused = False
+            logger.info("Risk pause lifted")
+    
+    def update_account_info(self):
+        # Use real balance from Deriv client
+        if self.deriv_client and self.deriv_client.balance:
+            self.account_balance = self.deriv_client.balance
+        else:
+            self.account_balance = 1000 + self.profit_loss
+        self.account_equity = self.account_balance
+    
+    def monitor_active_trades(self):
+        """Monitor and update real trades from Deriv"""
+        if not self.deriv_client:
+            return
+        
+        current_time = time.time()
+        completed_trades = []
+        
+        # Sync with Deriv client's active contracts
+        for contract_id, contract in self.deriv_client.active_contracts.items():
+            if contract['status'] == 'closed':
+                # Find and update our trade record
+                for our_trade_id, our_trade in self.active_trades.items():
+                    if (our_trade.get('real_contract_id') == contract_id or 
+                        our_trade.get('contract_id') == contract_id):
+                        
+                        profit = contract.get('profit', 0)
+                        if isinstance(profit, (int, float)):
+                            our_trade['profit'] = profit
+                            our_trade['status'] = 'closed'
+                            
+                            # Update global profit/loss
+                            if our_trade.get('profit_added') != True:
+                                self.profit_loss += profit
+                                our_trade['profit_added'] = True
+                                
+                                if profit < 0:
+                                    self.consecutive_losses += 1
+                                else:
+                                    self.consecutive_losses = 0
+                            
+                            completed_trades.append(our_trade_id)
+                            logger.info(f"Real trade closed - Contract: {contract_id}, Profit: {profit}")
+                        break
+        
+        # Remove completed trades after a delay
+        for contract_id in completed_trades:
+            trade = self.active_trades.get(contract_id)
+            if trade and trade.get('status') == 'closed':
+                if current_time - trade.get('start_time', datetime.now()).timestamp() > 300:
+                    del self.active_trades[contract_id]
+    
+    def reset_daily_metrics(self):
+        now = datetime.now()
+        if now.date() > self.last_reset_time.date():
+            self.profit_loss = 0
+            self.consecutive_losses = 0
+            self.daily_traded_volume = 0
+            self.last_reset_time = now
+            logger.info("Daily metrics reset")
+
+# Global bot instance
+bot = DerivHybridTradingBot()
+
+@app.route("/")
+def index():
+    return render_template('index.html')
+
+@app.route("/connect", methods=["POST"])
+def connect():
+    try:
+        data = request.get_json()
+        api_key = data.get("api_key")
+        account_id = data.get("account_id")
+        app_id = data.get("app_id", "1089")
+
+        if not api_key or not account_id or not app_id:
+            return jsonify({"status": "error", "message": "Missing API key, Account ID, or App ID"})
+
+        bot.api_key = api_key
+        bot.account_id = account_id
+        bot.app_id = app_id
+
+        # Save settings for persistence
+        save_settings(api_key, app_id, account_id)
+
+        connected = bot.connect_to_deriv()
+        if connected:
+            bot.authorize_account()
+            return jsonify({"status": "success", "message": f"Connected and authorized to account {account_id}"})
+        else:
+            return jsonify({"status": "error", "message": "Failed to connect"})
+
+    except Exception as e:
+        logger.exception("Connection error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/disconnect", methods=["POST"])
+def disconnect():
+    try:
+        bot.stop_trading()
+        if bot.deriv_client:
+            bot.deriv_client.stop()
+        bot.connected = False
+        bot.authorized = False
+        return jsonify({"status": "success", "message": "Disconnected successfully"})
+    except Exception as e:
+        logger.exception("Disconnect error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/restart", methods=["POST"])
+def restart():
+    try:
+        success = bot.restart_bot()
+        if success:
+            return jsonify({"status": "success", "message": "Bot restarted successfully"})
+        else:
+            return jsonify({"status": "error", "message": "Failed to restart bot"})
+    except Exception as e:
+        logger.exception("Restart error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/load_settings", methods=["GET"])
+def load_settings_endpoint():
+    """Load saved settings for the web interface"""
+    try:
+        settings = load_settings()
+        return jsonify(settings)
+    except Exception as e:
+        logger.exception("Load settings error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/start_trading", methods=["POST"])
+def start_trading():
+    try:
+        data = request.get_json()
+        bot.selected_symbol = data.get("symbol", "R_100")
+        bot.base_lot_size = float(data.get("lot_size", 0.01))
+        bot.max_open_trades = int(data.get("max_trades", 10))
+        bot.auto_lot_adjustment = data.get("auto_lot", True)
+
+        started = bot.start_trading()
+        if started:
+            return jsonify({"status": "success", "message": "Trading started"})
+        else:
+            return jsonify({"status": "error", "message": "Failed to start trading"})
+    except Exception as e:
+        logger.exception("Start trading error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/stop_trading", methods=["POST"])
+def stop_trading():
+    try:
+        bot.stop_trading()
+        return jsonify({"status": "success", "message": "Trading stopped"})
+    except Exception as e:
+        logger.exception("Stop trading error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/status", methods=["GET"])
+def status():
+    try:
+        trades = []
+        for contract_id, trade in bot.active_trades.items():
+            trades.append({
+                'contract_id': contract_id,
+                'symbol': trade['symbol'],
+                'direction': trade.get('direction', 'BUY'),
+                'contract_type': trade['contract_type'],
+                'lot_size': trade.get('lot_size', bot.base_lot_size),
+                'profit': trade.get('profit', 0)
+            })
+        
+        return jsonify({
+            "connected": bot.connected,
+            "authorized": bot.authorized,
+            "trading_enabled": bot.trading_enabled,
+            "account_type": "Demo" if bot.is_demo else "Real",
+            "app_id": bot.app_id,
+            "account_id": bot.account_id,
+            "active_trades": len(bot.active_trades),
+            "total_trades": bot.trade_count,
+            "trades": trades
+        })
+    except Exception as e:
+        logger.exception("Status check error")
+        return jsonify({"status": "error", "message": str(e)})
+
+# Enhanced: Auto-reconnect on startup with saved settings
+if __name__ == "__main__":
+    print("🚀 Starting Deriv Hybrid Auto-Trading Bot (Enhanced Edition)")
+    
+    # Load saved settings and auto-connect
+    saved = load_settings()
+    if saved:
+        bot.api_key = saved.get("api_key")
+        bot.account_id = saved.get("account_id")
+        bot.app_id = saved.get("app_id", "1089")
+        
+        if bot.api_key and bot.account_id and bot.app_id:
+            logger.info(f"🔄 Auto-reconnecting to {bot.account_id} (App ID: {bot.app_id})...")
+            try:
+                # Start connection in background thread
+                connect_thread = threading.Thread(target=bot.connect_to_deriv)
+                connect_thread.daemon = True
+                connect_thread.start()
+            except Exception as e:
+                logger.error(f"Auto-reconnect failed: {e}")
+
+    print("🌍 Web Interface running at: http://127.0.0.1:5000")
+    print("💡 Features: Persistent Settings • Auto-Reconnect • Account Verification • Restart Capability")
+    app.run(host="0.0.0.0", port=5000, debug=True)

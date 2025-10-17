@@ -1,0 +1,6 @@
+websocket-client==1.6.3
+flask==2.3.3
+threading
+uuid
+datetime
+pathlib

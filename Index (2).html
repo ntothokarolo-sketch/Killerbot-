@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deriv Hybrid Auto-Trading Bot</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; border-radius: 15px; box-shadow: 0 20px 40px rgba(0,0,0,0.1); overflow: hidden; }
+        .header { background: linear-gradient(135deg, #2c3e50 0%, #3498db 100%); color: white; padding: 30px; text-align: center; }
+        .header h1 { font-size: 2.5em; margin-bottom: 10px; }
+        .header .subtitle { font-size: 1.2em; opacity: 0.9; }
+        .content { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; padding: 30px; }
+        .panel { background: #f8f9fa; border-radius: 10px; padding: 25px; border: 1px solid #e9ecef; }
+        .panel h2 { color: #2c3e50; margin-bottom: 20px; font-size: 1.5em; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+        .form-group { margin-bottom: 20px; }
+        .form-group label { display: block; margin-bottom: 8px; font-weight: 600; color: #495057; }
+        .form-control { width: 100%; padding: 12px 15px; border: 2px solid #e9ecef; border-radius: 8px; font-size: 14px; transition: border-color 0.3s ease; }
+        .form-control:focus { outline: none; border-color: #3498db; }
+        .btn { background: linear-gradient(135deg, #3498db 0%, #2980b9 100%); color: white; border: none; padding: 15px 30px; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.3s ease; width: 100%; margin-top: 10px; }
+        .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(52, 152, 219, 0.4); }
+        .btn-stop { background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%); }
+        .btn-stop:hover { box-shadow: 0 5px 15px rgba(231, 76, 60, 0.4); }
+        .status-indicator { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; }
+        .status-connected { background: #27ae60; }
+        .status-disconnected { background: #e74c3c; }
+        .status-trading { background: #f39c12; }
+        .status-item { display: flex; justify-content: space-between; margin-bottom: 12px; padding: 10px; background: white; border-radius: 6px; border-left: 4px solid #3498db; }
+        .status-label { font-weight: 600; color: #495057; }
+        .status-value { font-weight: 600; color: #2c3e50; }
+        .trades-list { max-height: 300px; overflow-y: auto; }
+        .trade-item { background: white; margin-bottom: 10px; padding: 15px; border-radius: 8px; border-left: 4px solid #27ae60; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .trade-item.loss { border-left-color: #e74c3c; }
+        .trade-symbol { font-weight: bold; color: #2c3e50; }
+        .trade-type { color: #27ae60; font-weight: 600; }
+        .trade-type.SELL { color: #e74c3c; }
+        .app-id-info { background: #e3f2fd; padding: 10px; border-radius: 5px; margin-bottom: 15px; font-size: 12px; color: #1976d2; }
+        @media (max-width: 768px) { .content { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Deriv Hybrid Auto-Trading Bot</h1>
+            <div class="subtitle">Advanced Trading • Risk Management • Auto Strategy • Persistent Settings</div>
+        </div>
+        
+        <div class="content">
+            <div class="left-column">
+                <div class="panel">
+                    <h2>Connection Settings</h2>
+                    <form id="connectionForm">
+                        <div class="form-group">
+                            <label for="apiKey">API Key:</label>
+                            <input type="password" id="apiKey" class="form-control" placeholder="Enter your Deriv API key">
+                        </div>
+                        <div class="form-group">
+                            <label for="accountId">Account ID:</label>
+                            <input type="text" id="accountId" class="form-control" placeholder="Enter your Account ID">
+                        </div>
+                        <div class="form-group">
+                            <label for="appId">App ID:</label>
+                            <input type="text" id="appId" class="form-control" value="1089" placeholder="Enter your App ID">
+                            <div class="app-id-info">
+                                Default: 1089 (Deriv Demo). For real account, use your registered App ID.
+                            </div>
+                        </div>
+                        <button type="button" class="btn" onclick="connectBot()">Connect to Deriv</button>
+                    </form>
+                </div>
+
+                <div class="panel">
+                    <h2>Trading Configuration</h2>
+                    <form id="tradingForm">
+                        <div class="form-group">
+                            <label for="symbol">Market Symbol:</label>
+                            <select id="symbol" class="form-control">
+                                <optgroup label="Volatility Indices">
+                                    <option value="R_10">Volatility 10 Index</option>
+                                    <option value="R_25">Volatility 25 Index</option>
+                                    <option value="R_50">Volatility 50 Index</option>
+                                    <option value="R_75">Volatility 75 Index</option>
+                                    <option value="R_100" selected>Volatility 100 Index</option>
+                                    <option value="R_150">Volatility 150 Index</option>
+                                    <option value="R_200">Volatility 200 Index</option>
+                                </optgroup>
+                                <optgroup label="Boom & Crash">
+                                    <option value="BOOM1000">Boom 1000 Index</option>
+                                    <option value="BOOM500">Boom 500 Index</option>
+                                    <option value="BOOM300">Boom 300 Index</option>
+                                    <option value="CRASH1000">Crash 1000 Index</option>
+                                    <option value="CRASH500">Crash 500 Index</option>
+                                    <option value="CRASH300">Crash 300 Index</option>
+                                </optgroup>
+                                <optgroup label="Forex">
+                                    <option value="frxEURUSD">EUR/USD</option>
+                                    <option value="frxGBPUSD">GBP/USD</option>
+                                    <option value="frxUSDJPY">USD/JPY</option>
+                                </optgroup>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="lotSize">Base Lot Size:</label>
+                            <input type="number" id="lotSize" class="form-control" value="0.01" step="0.01" min="0.01">
+                        </div>
+                        <div class="form-group">
+                            <label for="maxTrades">Max Open Trades:</label>
+                            <input type="number" id="maxTrades" class="form-control" value="10" min="1" max="20">
+                        </div>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="autoLot" checked> Auto Lot Growth</label>
+                        </div>
+                        
+                        <button type="button" class="btn" onclick="startTrading()">Start Trading</button>
+                        <button type="button" class="btn btn-stop" onclick="stopTrading()">Stop Trading</button>
+                    </form>
+                </div>
+            </div>
+
+            <div class="right-column">
+                <div class="panel">
+                    <h2>System Status</h2>
+                    <div id="statusPanel">
+                        <div class="status-item">
+                            <span class="status-label">Connection:</span>
+                            <span class="status-value">
+                                <span id="connectionStatus" class="status-indicator status-disconnected"></span>
+                                <span id="connectionText">Disconnected</span>
+                            </span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Authorization:</span>
+                            <span class="status-value" id="authStatus">Not Authorized</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Trading Status:</span>
+                            <span class="status-value" id="tradingStatus">Stopped</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Account Type:</span>
+                            <span class="status-value" id="accountType">Unknown</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">App ID:</span>
+                            <span class="status-value" id="appIdStatus">Not Set</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Account ID:</span>
+                            <span class="status-value" id="accountIdStatus">Not Set</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Active Trades:</span>
+                            <span class="status-value" id="activeTrades">0</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Total Trades:</span>
+                            <span class="status-value" id="totalTrades">0</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h2>Active Trades</h2>
+                    <div id="tradesList" class="trades-list">
+                        <div class="trade-item">
+                            <div class="trade-symbol">No active trades</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function connectBot() {
+            const apiKey = document.getElementById('apiKey').value;
+            const accountId = document.getElementById('accountId').value;
+            const appId = document.getElementById('appId').value;
+            
+            if (!appId) {
+                alert('Please enter your App ID');
+                return;
+            }
+            
+            fetch('/connect', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    api_key: apiKey, 
+                    account_id: accountId,
+                    app_id: appId
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    updateStatus('connectionStatus', 'connected', 'Connected');
+                    updateStatus('authStatus', 'Authorized');
+                    updateStatus('appIdStatus', appId);
+                    updateStatus('accountIdStatus', accountId);
+                } else {
+                    alert('Connection failed: ' + data.message);
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('Connection error occurred');
+            });
+        }
+        
+        function startTrading() {
+            const symbol = document.getElementById('symbol').value;
+            const lotSize = parseFloat(document.getElementById('lotSize').value);
+            const maxTrades = parseInt(document.getElementById('maxTrades').value);
+            const autoLot = document.getElementById('autoLot').checked;
+            
+            fetch('/start_trading', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    symbol: symbol,
+                    lot_size: lotSize,
+                    max_trades: maxTrades,
+                    auto_lot: autoLot
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    updateStatus('tradingStatus', 'trading', 'Trading Active');
+                } else {
+                    alert('Failed to start trading: ' + data.message);
+                }
+            });
+        }
+        
+        function stopTrading() {
+            fetch('/stop_trading', {method: 'POST'})
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    updateStatus('tradingStatus', 'stopped', 'Trading Stopped');
+                }
+            });
+        }
+        
+        function updateStatus(elementId, status, text) {
+            const element = document.getElementById(elementId);
+            if (elementId === 'connectionStatus') {
+                const statusElement = document.getElementById('connectionStatus');
+                const textElement = document.getElementById('connectionText');
+                statusElement.className = `status-indicator status-${status}`;
+                textElement.textContent = text;
+            } else {
+                element.textContent = text || status;
+            }
+        }
+        
+        function updateBotStatus() {
+            fetch('/status')
+                .then(response => response.json())
+                .then(data => {
+                    updateStatus('connectionStatus', data.connected ? 'connected' : 'disconnected', 
+                                data.connected ? 'Connected' : 'Disconnected');
+                    updateStatus('authStatus', data.authorized ? 'Authorized' : 'Not Authorized');
+                    updateStatus('tradingStatus', data.trading_enabled ? 'trading' : 'stopped', 
+                                data.trading_enabled ? 'Trading Active' : 'Trading Stopped');
+                    updateStatus('accountType', data.account_type || 'Unknown');
+                    updateStatus('appIdStatus', data.app_id || 'Not Set');
+                    updateStatus('accountIdStatus', data.account_id || 'Not Set');
+                    document.getElementById('activeTrades').textContent = data.active_trades || 0;
+                    document.getElementById('totalTrades').textContent = data.total_trades || 0;
+
+                    const tradesList = document.getElementById('tradesList');
+                    tradesList.innerHTML = '';
+
+                    if (data.trades && data.trades.length > 0) {
+                        data.trades.forEach(trade => {
+                            const item = document.createElement('div');
+                            item.className = 'trade-item ' + (trade.profit < 0 ? 'loss' : '');
+                            item.innerHTML = `
+                                <div class="trade-symbol">${trade.symbol}</div>
+                                <div>Type: <span class="trade-type ${trade.contract_type}">${trade.contract_type}</span></div>
+                                <div>Lot: ${trade.lot_size}</div>
+                                <div>Profit: ${trade.profit ? trade.profit.toFixed(2) : '0.00'}</div>
+                            `;
+                            tradesList.appendChild(item);
+                        });
+                    } else {
+                        tradesList.innerHTML = '<div class="trade-item"><div class="trade-symbol">No active trades</div></div>';
+                    }
+                })
+                .catch(error => console.error('Status update error:', error));
+        }
+        
+        // Load saved settings on page load
+        window.addEventListener('load', function() {
+            fetch('/load_settings')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.api_key) {
+                        document.getElementById('apiKey').value = data.api_key;
+                    }
+                    if (data.account_id) {
+                        document.getElementById('accountId').value = data.account_id;
+                    }
+                    if (data.app_id) {
+                        document.getElementById('appId').value = data.app_id;
+                    }
+                });
+        });
+        
+        setInterval(updateBotStatus, 3000);
+        updateBotStatus();
+    </script>
+</body>
+</html>
